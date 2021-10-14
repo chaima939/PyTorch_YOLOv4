@@ -2,6 +2,7 @@ from utils.google_utils import *
 from utils.layers import *
 from utils.parse_config import *
 from utils import torch_utils
+from models import BiFPN
 
 ONNX_EXPORT = False
 
@@ -49,13 +50,7 @@ def create_modules(module_defs, img_size, cfg):
             elif mdef['activation'] == 'swish':
                 modules.add_module('activation', Swish())
             elif mdef['activation'] == 'mish':
-                modules.add_module('activation', Mish())
-            elif mdef['activation'] == 'emb':
-                modules.add_module('activation', F.normalize())
-            elif mdef['activation'] == 'logistic':
-                modules.add_module('activation', nn.Sigmoid())
-            elif mdef['activation'] == 'silu':
-                modules.add_module('activation', nn.SiLU())
+                modules.add_module('activation', MemoryEfficientMish())
 
         elif mdef['type'] == 'deformableconvolutional':
             bn = mdef['batch_normalize']
@@ -87,32 +82,7 @@ def create_modules(module_defs, img_size, cfg):
             elif mdef['activation'] == 'swish':
                 modules.add_module('activation', Swish())
             elif mdef['activation'] == 'mish':
-                modules.add_module('activation', Mish())
-            elif mdef['activation'] == 'silu':
-                modules.add_module('activation', nn.SiLU())
-                
-        elif mdef['type'] == 'dropout':
-            p = mdef['probability']
-            modules = nn.Dropout(p)
-
-        elif mdef['type'] == 'avgpool':
-            modules = GAP()
-
-        elif mdef['type'] == 'silence':
-            filters = output_filters[-1]
-            modules = Silence()
-
-        elif mdef['type'] == 'scale_channels':  # nn.Sequential() placeholder for 'shortcut' layer
-            layers = mdef['from']
-            filters = output_filters[-1]
-            routs.extend([i + l if l < 0 else l for l in layers])
-            modules = ScaleChannel(layers=layers)
-
-        elif mdef['type'] == 'sam':  # nn.Sequential() placeholder for 'shortcut' layer
-            layers = mdef['from']
-            filters = output_filters[-1]
-            routs.extend([i + l if l < 0 else l for l in layers])
-            modules = ScaleSpatial(layers=layers)
+                modules.add_module('activation', MemoryEfficientMish())
 
         elif mdef['type'] == 'BatchNorm2d':
             filters = output_filters[-1]
@@ -131,16 +101,6 @@ def create_modules(module_defs, img_size, cfg):
                 modules.add_module('MaxPool2d', maxpool)
             else:
                 modules = maxpool
-
-        elif mdef['type'] == 'local_avgpool':
-            k = mdef['size']  # kernel size
-            stride = mdef['stride']
-            avgpool = nn.AvgPool2d(kernel_size=k, stride=stride, padding=(k - 1) // 2)
-            if k == 2 and stride == 1:  # yolov3-tiny
-                modules.add_module('ZeroPad2d', nn.ZeroPad2d((0, 1, 0, 1)))
-                modules.add_module('AvgPool2d', avgpool)
-            else:
-                modules = avgpool
 
         elif mdef['type'] == 'upsample':
             if ONNX_EXPORT:  # explicitly state size, avoid scale_factor
@@ -182,10 +142,6 @@ def create_modules(module_defs, img_size, cfg):
         elif mdef['type'] == 'reorg3d':  # yolov3-spp-pan-scale
             pass
 
-        elif mdef['type'] == 'reorg':  # yolov3-spp-pan-scale
-            filters = 4 * output_filters[-1]
-            modules.add_module('Reorg', Reorg())
-
         elif mdef['type'] == 'yolo':
             yolo_index += 1
             stride = [8, 16, 32, 64, 128]  # P3, P4, P5, P6, P7 strides
@@ -205,12 +161,12 @@ def create_modules(module_defs, img_size, cfg):
                 bias_ = module_list[j][0].bias  # shape(255,)
                 bias = bias_[:modules.no * modules.na].view(modules.na, -1)  # shape(3,85)
                 #bias[:, 4] += -4.5  # obj
-                bias.data[:, 4] += math.log(8 / (640 / stride[yolo_index]) ** 2)  # obj (8 objects per 640 image)
-                bias.data[:, 5:] += math.log(0.6 / (modules.nc - 0.99))  # cls (sigmoid(p) = 1/nc)
+                bias[:, 4] += math.log(8 / (640 / stride[yolo_index]) ** 2)  # obj (8 objects per 640 image)
+                bias[:, 5:] += math.log(0.6 / (modules.nc - 0.99))  # cls (sigmoid(p) = 1/nc)
                 module_list[j][0].bias = torch.nn.Parameter(bias_, requires_grad=bias_.requires_grad)
-                
             except:
                 print('WARNING: smart bias initialization failure.')
+
         else:
             print('Warning: Unrecognized Layer Type: ' + mdef['type'])
 
@@ -223,32 +179,6 @@ def create_modules(module_defs, img_size, cfg):
         routs_binary[i] = True
     return module_list, routs_binary
 
-def run_yolo(anchors, nc, img_size, yolo_index, layers, stride):
-    yolo_index = -1
-    yolo_index += 1
-    stride = [8, 16, 32, 64, 128]  # P3, P4, P5, P6, P7 strides
-    if any(x in cfg for x in ['yolov4-tiny', 'fpn', 'yolov3']):  # P5, P4, P3 strides
-        stride = [32, 16, 8]
-    layers = []
-    modules = YOLOLayer(anchors=mdef['anchors'][mdef['mask']],  # anchor list
-                        nc=mdef['classes'],  # number of classes
-                        img_size=img_size,  # (416, 416)
-                        yolo_index=yolo_index,  # 0, 1, 2...
-                        layers=layers,  # output layers
-                        stride=stride[yolo_index])
-    yolo_out.append(modules(x, out))
-            # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
-    try:
-        j = layers[yolo_index] if 'from' in mdef else -1
-        bias_ = module_list[j][0].bias  # shape(255,)
-        bias = bias_[:modules.no * modules.na].view(modules.na, -1)  # shape(3,85)
-                #bias[:, 4] += -4.5  # obj
-        bias.data[:, 4] += math.log(8 / (640 / stride[yolo_index]) ** 2)  # obj (8 objects per 640 image)
-        bias.data[:, 5:] += math.log(0.6 / (modules.nc - 0.99))  # cls (sigmoid(p) = 1/nc)
-        module_list[j][0].bias = torch.nn.Parameter(bias_, requires_grad=bias_.requires_grad)
-                
-    except:
-        print('WARNING: smart bias initialization failure.')
 
 class YOLOLayer(nn.Module):
     def __init__(self, anchors, nc, img_size, yolo_index, layers, stride):
@@ -285,24 +215,7 @@ class YOLOLayer(nn.Module):
     def forward(self, p, out):
         ASFF = False  # https://arxiv.org/abs/1911.09516
         if ASFF:
-            i, n = self.index, self.nl  # index in layers, number of layers
-            p = out[self.layers[i]]
-            bs, _, ny, nx = p.shape  # bs, 255, 13, 13
-            if (self.nx, self.ny) != (nx, ny):
-                self.create_grids((nx, ny), p.device)
-
-            # outputs and weights
-            # w = F.softmax(p[:, -n:], 1)  # normalized weights
-            w = torch.sigmoid(p[:, -n:]) * (2 / n)  # sigmoid weights (faster)
-            # w = w / w.sum(1).unsqueeze(1)  # normalize across layer dimension
-
-            # weighted ASFF sum
-            p = out[self.layers[i]][:, :-n] * w[:, i:i + 1]
-            for j in range(n):
-                if j != i:
-                    p += w[:, j:j + 1] * \
-                         F.interpolate(out[self.layers[j]][:, :-n], size=[ny, nx], mode='bilinear', align_corners=False)
-
+           
         else:
             bs, _, ny, nx = p.shape  # bs, 255, 13, 13
             if (self.nx, self.ny) != (nx, ny):
@@ -388,7 +301,7 @@ class Darknet(nn.Module):
 
     def forward_once(self, x, augment=False, verbose=False):
         img_size = x.shape[-2:]  # height, width
-        yolo_out, out = [], []
+        yolo_out, out, self.inputs = [], [], []
         if verbose:
             print('0', x.shape)
             str = ''
@@ -403,9 +316,9 @@ class Darknet(nn.Module):
                            ), 0)
 
         for i, module in enumerate(self.module_list):
+            print(i)
             name = module.__class__.__name__
-            #print(name)
-            if name in ['WeightedFeatureFusion', 'FeatureConcat', 'FeatureConcat2', 'FeatureConcat3', 'FeatureConcat_l', 'ScaleChannel', 'ScaleSpatial']:  # sum, concat
+            if name in ['WeightedFeatureFusion', 'FeatureConcat', 'FeatureConcat2', 'FeatureConcat3', 'FeatureConcat_l']:  # sum, concat
                 if verbose:
                     l = [i - 1] + module.layers  # layers
                     sh = [list(x.shape)] + [list(out[i].shape) for i in module.layers]  # shapes
@@ -413,26 +326,55 @@ class Darknet(nn.Module):
                 x = module(x, out)  # WeightedFeatureFusion(), FeatureConcat()
             elif name == 'YOLOLayer':
                 yolo_out.append(module(x, out))
-            elif name == 'JDELayer':
-                yolo_out.append(module(x, out))
             else:  # run module directly, i.e. mtype = 'convolutional', 'upsample', 'maxpool', 'batchnorm2d' etc.
-                #print(module)
-                #print(x.shape)
                 x = module(x)
 
             out.append(x if self.routs[i] else [])
+
+            if i==54:
+                P3=x
+                #print('P3 number of channels: ', P3.shape) 
+                self.inputs.append(P3)
+            if i==85:
+                P4=x
+                self.inputs.append(P4)
+            if i==104:
+                P5=x
+                self.inputs.append(P5)
+                #print(inputs)
+            if i==132:
+                P6=x
+                self.inputs.append(P6)
+
+
+                fpn_num_filters = [256,512,1024]
+                conv_channel_coef = {# the channels of P3/P4/P5.
+                0: [40, 112, 320],
+                1: [40, 112, 320],
+                2: [48, 120, 352],
+                3: [48, 136, 384],
+                4: [56, 160, 448],
+                5: [64, 176, 512],
+                6: [72, 200, 576],
+                7: [72, 200, 576],
+                8: [80, 224, 640],
+                }
+            
+                self.bifpn = nn.Sequential(
+                  *[BiFPN.BiFPN(fpn_num_filters[i],
+                  conv_channel_coef[i],
+                  True if i == 0 else False,
+                  attention=True if i < 6 else False,
+                  use_p8=i > 7)
+                  for i in range(2)])
+                print(self.bifpn)
+                features = self.bifpn(inputs)
+
+                print('outs: ', features)
+
             if verbose:
                 print('%g/%g %s -' % (i, len(self.module_list), name), list(x.shape), str)
                 str = ''
-        #P3
-        layers = 54
-        filters = sum([output_filters[l + 1 if l > 0 else l] for l in layers])
-        routs.extend([i + l if l < 0 else l for l in layers])
-        modules = FeatureConcat(layers=layers)
-        nn.Conv2d(in_channels=output_filters[-1],out_channels=75,kernel_size=1,stride=1,padding=1,groups= 1,bias=0)
-        a = run_yolo([12, 16, 19, 36, 40, 28], 20, img_size, 0, [], [8, 16, 32, 64, 128])
-        o = a()
-        #P4
 
         if self.training:  # train
             return yolo_out
@@ -472,7 +414,8 @@ class Darknet(nn.Module):
 
 
 def get_yolo_layers(model):
-    return 4
+    return [i for i, m in enumerate(model.module_list) if m.__class__.__name__ == 'YOLOLayer']  # [89, 101, 113]
+
 
 def load_darknet_weights(self, weights, cutoff=-1):
     # Parses and loads the weights stored in 'weights'
