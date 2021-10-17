@@ -2,9 +2,9 @@ from utils.google_utils import *
 from utils.layers import *
 from utils.parse_config import *
 from utils import torch_utils
+from models.BiFPN2 import BiFPN
 
 ONNX_EXPORT = False
-
 
 def create_modules(module_defs, img_size, cfg):
     # Constructs module list of layer blocks from module configuration in module_defs
@@ -322,6 +322,7 @@ class Darknet(nn.Module):
         self.module_defs = parse_model_cfg(cfg)
         self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg)
         self.yolo_layers = get_yolo_layers(self)
+        self. inputs = []
         # torch_utils.initialize_weights(self)
 
         # Darknet Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
@@ -347,14 +348,6 @@ class Darknet(nn.Module):
             y[1][..., :4] /= s[0]  # scale
             y[1][..., 0] = img_size[1] - y[1][..., 0]  # flip lr
             y[2][..., :4] /= s[1]  # scale
-
-            # for i, yi in enumerate(y):  # coco small, medium, large = < 32**2 < 96**2 <
-            #     area = yi[..., 2:4].prod(2)[:, :, None]
-            #     if i == 1:
-            #         yi *= (area < 96. ** 2).float()
-            #     elif i == 2:
-            #         yi *= (area > 32. ** 2).float()
-            #     y[i] = yi
 
             y = torch.cat(y, 1)
             return y, None
@@ -409,13 +402,38 @@ class Darknet(nn.Module):
             if i==132:
                 P6=x
                 self.inputs.append(P6)
-
             if verbose:
                 print('%g/%g %s -' % (i, len(self.module_list), name), list(x.shape), str)
                 str = ''
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.BiFPN = nn.Sequential(BiFPN(256), BiFPN(512), BiFPN(1024), BiFPN(1024)).to(device)
+        #bi = BiFPN(1024).to(device)
+        bi_out = self.BiFPN(self.inputs)
+        
+        mod = nn.Conv2d(in_channels=256,out_channels=75,kernel_size=1,stride=1,padding=1,groups= 1,bias=0)
+        x = mod(bi_out[0])
+        mod = run_yolo([12, 16, 19, 36, 40, 28], 20, img_size, -1)
+        yolo_out.append(mod(x,out))
 
+        mod = nn.Conv2d(in_channels=512,out_channels=75,kernel_size=1,stride=1,padding=1,groups= 1,bias=0)
+        x = mod(bi_out[1])
+        mod = run_yolo([36, 75, 76, 55, 72, 146], 20, img_size, 0)
+        yolo_out.append(mod(x,out))
+
+        mod = nn.Conv2d(in_channels=1024,out_channels=75,kernel_size=1,stride=1,padding=1,groups= 1,bias=0)
+        x = mod(bi_out[2])
+        mod = run_yolo([142, 110, 192, 243, 459, 401], 20, img_size, 1)
+        yolo_out.append(mod(x,out))
+
+        mod = nn.Conv2d(in_channels=1024,out_channels=75,kernel_size=1,stride=1,padding=1,groups= 1,bias=0)
+        x = mod(bi_out[3])
+        mod = run_yolo([324,451, 545,357, 616,618], 20, img_size, 2)
+        yolo_out.append(mod(x,out))
+       
         if self.training:  # train
             return yolo_out
+            print(yolo_out)
         elif ONNX_EXPORT:  # export
             x = [torch.cat(x, 0) for x in zip(*yolo_out)]
             return x[0], torch.cat(x[1:3], 1)  # scores, boxes: 3780x80, 3780x4
@@ -429,6 +447,34 @@ class Darknet(nn.Module):
                 x[2][..., :4] /= s[1]  # scale
                 x = torch.cat(x, 1)
             return x, p
+    
+    def run_yolo(self,anchors, nc, img_size, yolo_index):
+        yolo_index += 1
+        stride = [8, 16, 32, 64, 128]  # P3, P4, P5, P6, P7 strides
+
+        layers = []
+        modules = YOLOLayer(anchors=anchors,  # anchor list
+                            nc=nc,  # number of classes
+                            img_size=img_size,  # (416, 416)
+                            yolo_index=yolo_index,  # 0, 1, 2...
+                            layers=layers,  # output layers
+                            stride=stride[yolo_index])
+
+            # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
+        try:
+            j = -1
+            bias_ = self.module_list[j][0].bias  # shape(255,)
+            bias = bias_[:modules.no * modules.na].view(modules.na, -1)  # shape(3,85)
+        #bias[:, 4] += -4.5  # obj
+            bias.data[:, 4] += math.log(8 / (640 / stride[yolo_index]) ** 2)  # obj (8 objects per 640 image)
+            bias.data[:, 5:] += math.log(0.6 / (20 - 0.99))  # cls (sigmoid(p) = 1/nc)
+            self.module_list[j][0].bias = torch.nn.Parameter(bias_, requires_grad=bias_.requires_grad)
+                
+        except:
+            print('WARNING: smart bias initialization failure.')
+        return modules
+
+        
 
     def fuse(self):
         # Fuse Conv2d + BatchNorm2d layers throughout model
