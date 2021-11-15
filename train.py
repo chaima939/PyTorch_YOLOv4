@@ -129,16 +129,13 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
-    best_fitness_p, best_fitness_r, best_fitness_ap50, best_fitness_ap, best_fitness_f = 0.0, 0.0, 0.0, 0.0, 0.0
+    best_fitness_ap50, best_fitness_f = 0.0, 0.0
     if pretrained:
         # Optimizer
         if ckpt['optimizer'] is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
-            best_fitness_p = ckpt['best_fitness_p']
-            best_fitness_r = ckpt['best_fitness_r']
             best_fitness_ap50 = ckpt['best_fitness_ap50']
-            best_fitness_ap = ckpt['best_fitness_ap']
             best_fitness_f = ckpt['best_fitness_f']
 
         # Results
@@ -227,8 +224,6 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     logger.info('Image sizes %g train, %g test\n'
                 'Using %g dataloader workers\nLogging results to %s\n'
                 'Starting training for %g epochs...' % (imgsz, imgsz_test, dataloader.num_workers, save_dir, epochs))
-    
-    torch.save(model, wdir / 'init.pt')
     
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
@@ -372,14 +367,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 fi_f = 0.0
             if fi > best_fitness:
                 best_fitness = fi
-            if fi_p > best_fitness_p:
-                best_fitness_p = fi_p
-            if fi_r > best_fitness_r:
-                best_fitness_r = fi_r
             if fi_ap50 > best_fitness_ap50:
                 best_fitness_ap50 = fi_ap50
-            if fi_ap > best_fitness_ap:
-                best_fitness_ap = fi_ap
             if fi_f > best_fitness_f:
                 best_fitness_f = fi_f
 
@@ -389,10 +378,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 with open(results_file, 'r') as f:  # create checkpoint
                     ckpt = {'epoch': epoch,
                             'best_fitness': best_fitness,
-                            'best_fitness_p': best_fitness_p,
-                            'best_fitness_r': best_fitness_r,
                             'best_fitness_ap50': best_fitness_ap50,
-                            'best_fitness_ap': best_fitness_ap,
                             'best_fitness_f': best_fitness_f,
                             'training_results': f.read(),
                             'model': ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict(),
@@ -403,28 +389,10 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
-                if (best_fitness == fi) and (epoch >= 200):
-                    torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
                 if best_fitness == fi:
                     torch.save(ckpt, wdir / 'best_overall.pt')
-                if best_fitness_p == fi_p:
-                    torch.save(ckpt, wdir / 'best_p.pt')
-                if best_fitness_r == fi_r:
-                    torch.save(ckpt, wdir / 'best_r.pt')
                 if best_fitness_ap50 == fi_ap50:
                     torch.save(ckpt, wdir / 'best_ap50.pt')
-                if best_fitness_ap == fi_ap:
-                    torch.save(ckpt, wdir / 'best_ap.pt')
-                if best_fitness_f == fi_f:
-                    torch.save(ckpt, wdir / 'best_f.pt')
-                if epoch == 0:
-                    torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                if ((epoch+1) % 25) == 0:
-                    torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                if epoch >= (epochs-5):
-                    torch.save(ckpt, wdir / 'last_{:03d}.pt'.format(epoch))
-                elif epoch >= 420: 
-                    torch.save(ckpt, wdir / 'last_{:03d}.pt'.format(epoch))
                 del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training

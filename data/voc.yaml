@@ -1,7 +1,6 @@
-# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
-path: /VOC
-train: /VOC/images/train
-val: /VOC/images/val
+path: /content/VOC
+train: /content/VOC/images/train
+val: /content/VOC/images/val
 
 # Classes
 nc: 20  # number of classes
