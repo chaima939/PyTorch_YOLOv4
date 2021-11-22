@@ -2,10 +2,7 @@ from utils.google_utils import *
 from utils.layers import *
 from utils.parse_config import *
 from utils import torch_utils
-from models.GC import ContextBlock
-from models.Eca import eca_layer
-from models.sk import SKConv
-ONNX_EXPORT = False
+from models.BFP import *
 
 def create_modules(module_defs, img_size, cfg):
     # Constructs module list of layer blocks from module configuration in module_defs
@@ -55,40 +52,6 @@ def create_modules(module_defs, img_size, cfg):
                 modules.add_module('activation', F.normalize())
             elif mdef['activation'] == 'logistic':
                 modules.add_module('activation', nn.Sigmoid())
-            elif mdef['activation'] == 'silu':
-                modules.add_module('activation', nn.SiLU())
-
-        elif mdef['type'] == 'deformableconvolutional':
-            bn = mdef['batch_normalize']
-            filters = mdef['filters']
-            k = mdef['size']  # kernel size
-            stride = mdef['stride'] if 'stride' in mdef else (mdef['stride_y'], mdef['stride_x'])
-            if isinstance(k, int):  # single-size conv
-                modules.add_module('DeformConv2d', DeformConv2d(output_filters[-1],
-                                                       filters,
-                                                       kernel_size=k,
-                                                       padding=k // 2 if mdef['pad'] else 0,
-                                                       stride=stride,
-                                                       bias=not bn,
-                                                       modulation=True))
-            else:  # multiple-size conv
-                modules.add_module('MixConv2d', MixConv2d(in_ch=output_filters[-1],
-                                                          out_ch=filters,
-                                                          k=k,
-                                                          stride=stride,
-                                                          bias=not bn))
-
-            if bn:
-                modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.03, eps=1E-4))
-            else:
-                routs.append(i)  # detection output (goes into yolo layer)
-
-            if mdef['activation'] == 'leaky':  # activation study https://github.com/ultralytics/yolov3/issues/441
-                modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
-            elif mdef['activation'] == 'swish':
-                modules.add_module('activation', Swish())
-            elif mdef['activation'] == 'mish':
-                modules.add_module('activation', Mish())
             elif mdef['activation'] == 'silu':
                 modules.add_module('activation', nn.SiLU())
                 
@@ -144,11 +107,7 @@ def create_modules(module_defs, img_size, cfg):
                 modules = avgpool
 
         elif mdef['type'] == 'upsample':
-            if ONNX_EXPORT:  # explicitly state size, avoid scale_factor
-                g = (yolo_index + 1) * 2 / 32  # gain
-                modules = nn.Upsample(size=tuple(int(x * g) for x in img_size))  # img_size = (320, 192)
-            else:
-                modules = nn.Upsample(scale_factor=mdef['stride'])
+            modules = nn.Upsample(scale_factor=mdef['stride'])
 
         elif mdef['type'] == 'route':  # nn.Sequential() placeholder for 'route' layer
             layers = mdef['layers']
@@ -168,35 +127,15 @@ def create_modules(module_defs, img_size, cfg):
             routs.extend([i + l if l < 0 else l for l in layers])
             modules = FeatureConcat3(layers=layers)
 
-        elif mdef['type'] == 'route_lhalf':  # nn.Sequential() placeholder for 'route' layer
-            layers = mdef['layers']
-            filters = sum([output_filters[l + 1 if l > 0 else l] for l in layers])//2
-            routs.extend([i + l if l < 0 else l for l in layers])
-            modules = FeatureConcat_l(layers=layers)
-
         elif mdef['type'] == 'shortcut':  # nn.Sequential() placeholder for 'shortcut' layer
             layers = mdef['from']
             filters = output_filters[-1]
             routs.extend([i + l if l < 0 else l for l in layers])
             modules = WeightedFeatureFusion(layers=layers, weight='weights_type' in mdef)
 
-        elif mdef['type'] == 'gc':
-            filters = output_filters[-1]
-            modules = ContextBlock(inplanes=filters, ratio=4, pooling_type='att', fusion_types=('channel_add', ))
-
-        elif mdef['type'] == 'eca':
-            filters = output_filters[-1]
-            modules = eca_layer(filters, 3)
-
-        elif mdef['type'] == 'sk':
-            filters = output_filters[-1]
-            modules = SKConv(filters, 32, 2, 8, 2, stride=1)
-
         elif mdef['type'] == 'yolo':
             yolo_index += 1
             stride = [8, 16, 32, 64, 128]  # P3, P4, P5, P6, P7 strides
-            if any(x in cfg for x in ['yolov4-tiny', 'fpn', 'yolov3']):  # P5, P4, P3 strides
-                stride = [32, 16, 8]
             layers = mdef['from'] if 'from' in mdef else []
             modules = YOLOLayer(anchors=mdef['anchors'][mdef['mask']],  # anchor list
                                 nc=mdef['classes'],  # number of classes
@@ -217,7 +156,6 @@ def create_modules(module_defs, img_size, cfg):
                 
             except:
                 print('WARNING: smart bias initialization failure.')
-
         else:
             print('Warning: Unrecognized Layer Type: ' + mdef['type'])
 
@@ -246,10 +184,6 @@ class YOLOLayer(nn.Module):
         self.anchor_vec = self.anchors / self.stride
         self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2)
 
-        if ONNX_EXPORT:
-            self.training = False
-            self.create_grids((img_size[1] // stride, img_size[0] // stride))  # number x, y grid points
-
     def create_grids(self, ng=(13, 13), device='cpu'):
         self.nx, self.ny = ng  # x and y grid size
         self.ng = torch.tensor(ng, dtype=torch.float)
@@ -263,29 +197,10 @@ class YOLOLayer(nn.Module):
             self.anchor_vec = self.anchor_vec.to(device)
             self.anchor_wh = self.anchor_wh.to(device)
 
-    def forward(self, p, out):
+    def forward(self, p):
         ASFF = False  # https://arxiv.org/abs/1911.09516
         if ASFF:
             i, n = self.index, self.nl  # index in layers, number of layers
-            p = out[self.layers[i]]
-            bs, _, ny, nx = p.shape  # bs, 255, 13, 13
-            if (self.nx, self.ny) != (nx, ny):
-                self.create_grids((nx, ny), p.device)
-
-            # outputs and weights
-            # w = F.softmax(p[:, -n:], 1)  # normalized weights
-            w = torch.sigmoid(p[:, -n:]) * (2 / n)  # sigmoid weights (faster)
-            # w = w / w.sum(1).unsqueeze(1)  # normalize across layer dimension
-
-            # weighted ASFF sum
-            p = out[self.layers[i]][:, :-n] * w[:, i:i + 1]
-            for j in range(n):
-                if j != i:
-                    p += w[:, j:j + 1] * \
-                         F.interpolate(out[self.layers[j]][:, :-n], size=[ny, nx], mode='bilinear', align_corners=False)
-
-        elif ONNX_EXPORT:
-            bs = 1  # batch size
         else:
             bs, _, ny, nx = p.shape  # bs, 255, 13, 13
             if (self.nx, self.ny) != (nx, ny):
@@ -296,33 +211,17 @@ class YOLOLayer(nn.Module):
 
         if self.training:
             return p
-
-        elif ONNX_EXPORT:
-            # Avoid broadcasting for ANE operations
-            m = self.na * self.nx * self.ny
-            ng = 1. / self.ng.repeat(m, 1)
-            grid = self.grid.repeat(1, self.na, 1, 1, 1).view(m, 2)
-            anchor_wh = self.anchor_wh.repeat(1, 1, self.nx, self.ny, 1).view(m, 2) * ng
-
-            p = p.view(m, self.no)
-            xy = torch.sigmoid(p[:, 0:2]) + grid  # x, y
-            wh = torch.exp(p[:, 2:4]) * anchor_wh  # width, height
-            p_cls = torch.sigmoid(p[:, 4:5]) if self.nc == 1 else \
-                torch.sigmoid(p[:, 5:self.no]) * torch.sigmoid(p[:, 4:5])  # conf
-            return p_cls, xy * ng, wh
-
         else:  # inference
             io = p.sigmoid()
             io[..., :2] = (io[..., :2] * 2. - 0.5 + self.grid)
             io[..., 2:4] = (io[..., 2:4] * 2) ** 2 * self.anchor_wh
             io[..., :4] *= self.stride
-
             return io.view(bs, -1, self.no), p  # view [1, 3, 13, 13, 85] as [1, 507, 85]
 
-class Darknet(nn.Module):
-    # YOLOv3 object detection model
 
-    def __init__(self, cfg, img_size=(416, 416), verbose=False):
+class Darknet(nn.Module):
+
+    def __init__(self, cfg, img_size=(512, 512), verbose=False):
         super(Darknet, self).__init__()
 
         self.module_defs = parse_model_cfg(cfg)
@@ -333,13 +232,13 @@ class Darknet(nn.Module):
         # Darknet Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
         self.version = np.array([0, 2, 5], dtype=np.int32)  # (int32) version info: major, minor, revision
         self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
-        self.info(verbose) if not ONNX_EXPORT else None  # print model description
+        #self.info(verbose) if not ONNX_EXPORT else None  # print model description
 
     def forward(self, x, augment=False, verbose=False):
 
         if not augment:
             return self.forward_once(x)
-        else:  # Augment images (inference and test only) https://github.com/ultralytics/yolov3/issues/931
+        else: 
             img_size = x.shape[-2:]  # height, width
             s = [0.83, 0.67]  # scales
             y = []
@@ -353,19 +252,18 @@ class Darknet(nn.Module):
             y[1][..., :4] /= s[0]  # scale
             y[1][..., 0] = img_size[1] - y[1][..., 0]  # flip lr
             y[2][..., :4] /= s[1]  # scale
-
             y = torch.cat(y, 1)
             return y, None
 
     def forward_once(self, x, augment=False, verbose=False):
         img_size = x.shape[-2:]  # height, width
-        yolo_out, out = [], []
+        yolo_out, out, inputs, out_bfp = [], [], [], []
         if verbose:
             print('0', x.shape)
             str = ''
 
         # Augment images (inference and test only)
-        if augment:  # https://github.com/ultralytics/yolov3/issues/931
+        if augment:  
             nb = x.shape[0]  # batch size
             s = [0.83, 0.67]  # scales
             x = torch.cat((x,
@@ -375,25 +273,46 @@ class Darknet(nn.Module):
 
         for i, module in enumerate(self.module_list):
             name = module.__class__.__name__
-            #print(name)
             if name in ['WeightedFeatureFusion', 'FeatureConcat', 'FeatureConcat2', 'FeatureConcat3', 'FeatureConcat_l', 'ScaleChannel', 'ScaleSpatial']:  # sum, concat
                 if verbose:
                     l = [i - 1] + module.layers  # layers
                     sh = [list(x.shape)] + [list(out[i].shape) for i in module.layers]  # shapes
                     str = ' >> ' + ' + '.join(['layer %g %s' % x for x in zip(l, sh)])
                 x = module(x, out)  # WeightedFeatureFusion(), FeatureConcat()
-            elif name == 'YOLOLayer':
-                yolo_out.append(module(x, out))
+            #elif name == 'YOLOLayer':
+            #    yolo_out.append(module(x, out))            
             else:  # run module directly, i.e. mtype = 'convolutional', 'upsample', 'maxpool', 'batchnorm2d' etc.
                 #print(module)
                 #print(x.shape)
                 x = module(x)
 
             out.append(x if self.routs[i] else [])
+                
             if verbose:
                 print('%g/%g %s -' % (i, len(self.module_list), name), list(x.shape), str)
                 str = ''
 
+            if i==138:
+                P3=x
+                inputs.append(P3)
+            if i==149:
+                P4=x
+                inputs.append(P4)
+            if i==160:
+                P5=x
+                inputs.append(P5)
+
+        modb = BFP(in_channels=75,num_levels=3,refine_level=2,refine_type='non_local')
+        out_bfp = modb(inputs)
+        for i, module in enumerate(self.module_list):
+            name = module.__class__.__name__
+            #print(name)
+            if i == 139:
+                yolo_out.append(module(out_bfp[0]))
+            if i == 150:
+                yolo_out.append(module(out_bfp[1])) 
+            if i == 161:
+                yolo_out.append(module(out_bfp[2]))
         if self.training:  # train
             return yolo_out
         else:  # inference or test
@@ -422,14 +341,15 @@ class Darknet(nn.Module):
                         break
             fused_list.append(a)
         self.module_list = fused_list
-        self.info() if not ONNX_EXPORT else None  # yolov3-spp reduced from 225 to 152 layers
+        #self.info() if not ONNX_EXPORT else None  # yolov3-spp reduced from 225 to 152 layers
 
     def info(self, verbose=False):
         torch_utils.model_info(self, verbose)
 
 
 def get_yolo_layers(model):
-    return [i for i, m in enumerate(model.module_list) if m.__class__.__name__ in ['YOLOLayer', 'JDELayer']]  
+    return [i for i, m in enumerate(model.module_list) if m.__class__.__name__ in ['YOLOLayer', 'JDELayer']]  # [89, 101, 113]
+
 
 def load_darknet_weights(self, weights, cutoff=-1):
     # Parses and loads the weights stored in 'weights'
