@@ -5,6 +5,7 @@ from utils import torch_utils
 from models.GC import ContextBlock
 from models.Eca import eca_layer
 from models.sk import SKConv
+from models.SE import SELayer
 ONNX_EXPORT = False
 
 def create_modules(module_defs, img_size, cfg):
@@ -179,6 +180,10 @@ def create_modules(module_defs, img_size, cfg):
             filters = output_filters[-1]
             routs.extend([i + l if l < 0 else l for l in layers])
             modules = WeightedFeatureFusion(layers=layers, weight='weights_type' in mdef)
+
+        elif mdef['type'] == 'se':
+            filters = output_filters[-1]
+            modules = SELayer(filters,16) 
 
         elif mdef['type'] == 'gc':
             filters = output_filters[-1]
