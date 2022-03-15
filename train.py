@@ -337,8 +337,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                                  save_dir=save_dir,
                                                  plots=plots and final_epoch,
                                                  log_imgs=opt.log_imgs if wandb else 0)
-                if epoch==0:
-                    logger.info('%g epochs completed in %.3f minutes.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 60))
+                if epoch==10:
+                    logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
 
             # Write
             with open(results_file, 'a') as f:
