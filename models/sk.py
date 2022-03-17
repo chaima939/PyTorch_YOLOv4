@@ -1,56 +1,51 @@
+import numpy as np
 import torch
 from torch import nn
+from torch.nn import init
+from collections import OrderedDict
 
-class SKConv(nn.Module):
-    def __init__(self, features, WH, M, G, r, stride=1 ,L=32):
-        """ Constructor
-        Args:
-            features: input channel dimensionality.
-            WH: input spatial dimensionality, used for GAP kernel size.
-            M: the number of branchs.
-            G: num of convolution groups.
-            r: the radio for compute d, the length of z.
-            stride: stride, default 1.
-            L: the minimum dim of the vector z in paper, default 32.
-        """
-        super(SKConv, self).__init__()
-        d = max(int(features/r), L)
-        self.M = M
-        self.features = features
-        self.convs = nn.ModuleList([])
-        for i in range(M):
-            self.convs.append(nn.Sequential(
-                nn.Conv2d(features, features, kernel_size=3+i*2, stride=stride, padding=1+i, groups=G),
-                nn.BatchNorm2d(features),
-                nn.ReLU(inplace=False)
-            ))
-        # self.gap = nn.AvgPool2d(int(WH/stride))
-        self.fc = nn.Linear(features, d)
-        self.fcs = nn.ModuleList([])
-        for i in range(M):
-            self.fcs.append(
-                nn.Linear(d, features)
+class SKAttention(nn.Module):
+    def __init__(self, channel,kernels=[3,5,7],reduction=16,group=1,L=32):
+        super().__init__()
+        self.d=max(L,channel//reduction)
+        self.convs=nn.ModuleList([])
+        for k in kernels:
+            self.convs.append(
+                nn.Sequential(OrderedDict([
+                    ('conv',nn.Conv2d(channel,channel,kernel_size=k,padding=k//2,groups=group)),
+                    ('bn',nn.BatchNorm2d(channel)),
+                    ('relu',nn.ReLU())
+                ]))
             )
-        self.softmax = nn.Softmax(dim=1)
-        
+        self.fc=nn.Linear(channel,self.d)
+        self.fcs=nn.ModuleList([])
+        for i in range(len(kernels)):
+            self.fcs.append(nn.Linear(self.d,channel))
+        self.softmax=nn.Softmax(dim=0)
+
     def forward(self, x):
-        for i, conv in enumerate(self.convs):
-            fea = conv(x).unsqueeze_(dim=1)
-            if i == 0:
-                feas = fea
-            else:
-                feas = torch.cat([feas, fea], dim=1)
-        fea_U = torch.sum(feas, dim=1)
-        # fea_s = self.gap(fea_U).squeeze_()
-        fea_s = fea_U.mean(-1).mean(-1)
-        fea_z = self.fc(fea_s)
-        for i, fc in enumerate(self.fcs):
-            vector = fc(fea_z).unsqueeze_(dim=1)
-            if i == 0:
-                attention_vectors = vector
-            else:
-                attention_vectors = torch.cat([attention_vectors, vector], dim=1)
-        attention_vectors = self.softmax(attention_vectors)
-        attention_vectors = attention_vectors.unsqueeze(-1).unsqueeze(-1)
-        fea_v = (feas * attention_vectors).sum(dim=1)
-        return fea_v
+        bs, c, _, _ = x.size()
+        conv_outs=[]
+        ### split
+        for conv in self.convs:
+            conv_outs.append(conv(x))
+        feats=torch.stack(conv_outs,0)#k,bs,channel,h,w
+
+        ### fuse
+        U=sum(conv_outs) #bs,c,h,w
+
+        ### reduction channel
+        S=U.mean(-1).mean(-1) #bs,c
+        Z=self.fc(S) #bs,d
+
+        ### calculate attention weight
+        weights=[]
+        for fc in self.fcs:
+            weight=fc(Z)
+            weights.append(weight.view(bs,c,1,1)) #bs,channel
+        attention_weughts=torch.stack(weights,0)#k,bs,channel,1,1
+        attention_weughts=self.softmax(attention_weughts)#k,bs,channel,1,1
+
+        ### fuse
+        V=(attention_weughts*feats).sum(0)
+        return V
